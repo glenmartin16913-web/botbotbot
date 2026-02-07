@@ -294,7 +294,7 @@ async def safe_edit_or_send(
     parse_mode=ParseMode.HTML,
 ):
     """
-    Если callback_query — редактируем одно и то же сообщение (красиво).
+    Если callback_query — редактируем одно и то же сообщение.
     Если обычное сообщение — удаляем прошлое "служебное" сообщение бота и отправляем новое.
     """
     if update.callback_query:
@@ -345,9 +345,24 @@ async def fetch_counterparty_tags(counterparty: str, limit: int = 10) -> List[Di
     return await sb_exec(_work)
 
 
-def summarize_tags(tags: List[Dict[str, Any]]) -> Tuple[str, str]:
+def render_counterparty_card(counterparty: str, tags: List[Dict[str, Any]]) -> str:
+    """
+    Красивое отображение контрагента: статус + счетчики + последние отметки.
+    Статус на русском:
+      red   -> Высокий риск
+      yellow-> Требует внимания
+      green -> Можно работать
+    """
+    cp = counterparty.strip()
+
     if not tags:
-        return "🏷️ Тегов пока нет.", ""
+        return (
+            "👤 <b>Контрагент</b>\n"
+            f"└ <b>{cp}</b>\n\n"
+            "🏷️ <b>Статус</b>\n"
+            "└ Пока нет отметок.\n\n"
+            "ℹ️ Нажми «➕ Добавить тег», чтобы оставить первую отметку."
+        )
 
     counts = {"red": 0, "yellow": 0, "green": 0}
     for t in tags:
@@ -355,25 +370,37 @@ def summarize_tags(tags: List[Dict[str, Any]]) -> Tuple[str, str]:
         if c in counts:
             counts[c] += 1
 
-    order = [("red", "🟥"), ("yellow", "🟨"), ("green", "🟩")]
-    # самый частый; при равенстве — красный > жёлтый > зелёный
-    marker_color = max(order, key=lambda x: (counts[x[0]], -order.index(x)))[0]
-    marker_emoji = dict(order).get(marker_color, "🏷️")
+    # Определяем доминирующий цвет
+    priority = {"red": 3, "yellow": 2, "green": 1}
+    dominant = max(counts.keys(), key=lambda c: (counts[c], priority[c]))
 
-    marker_line = f"{marker_emoji} Маркер: 🟥{counts['red']}  🟨{counts['yellow']}  🟩{counts['green']}"
+    if dominant == "red":
+        badge = "🟥 <b>Высокий риск</b>"
+    elif dominant == "yellow":
+        badge = "🟨 <b>Требует внимания</b>"
+    else:
+        badge = "🟩 <b>Можно работать</b>"
 
-    lines = []
+    header = (
+        "👤 <b>Контрагент</b>\n"
+        f"└ <b>{cp}</b>\n\n"
+        "🏷️ <b>Статус</b>\n"
+        f"└ {badge}\n\n"
+        "📌 <b>Сводка</b>\n"
+        f"└ 🟥 <b>{counts['red']}</b>   🟨 <b>{counts['yellow']}</b>   🟩 <b>{counts['green']}</b>\n"
+    )
+
+    notes = []
     for t in tags[:7]:
         c = (t.get("color") or "").lower()
         emoji = "🟥" if c == "red" else "🟨" if c == "yellow" else "🟩" if c == "green" else "🏷️"
-        author = t.get("created_by_username") or (str(t.get("created_by_telegram_id") or ""))
+        author = t.get("created_by_username") or str(t.get("created_by_telegram_id") or "unknown")
         comment = (t.get("comment") or "").strip()
-        if len(comment) > 140:
-            comment = comment[:140] + "…"
-        lines.append(f"{emoji} <b>{author}</b>: {comment}")
+        if len(comment) > 160:
+            comment = comment[:160] + "…"
+        notes.append(f"{emoji} <b>{author}</b> — {comment}")
 
-    details = "\n".join(lines)
-    return marker_line, details
+    return header + "\n<b>Последние отметки</b>\n" + "\n".join(notes)
 
 
 async def save_counterparty_tag(counterparty: str, color: str, comment: str, by_id: int, by_username: Optional[str]) -> None:
@@ -572,7 +599,7 @@ async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await help_cmd(update, context)
         return
 
-    # Если почему-то не попали в ConversationHandler — вручную откроем админку
+    # на всякий: ручной вход в админку, если вдруг не словили конверсейшном
     if text == BTN_ADMIN:
         await admin_entry(update, context)
         return
@@ -638,7 +665,6 @@ async def check_card_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except Exception as e:
             logger.warning(f"BINLIST API error: {e}")
 
-    # по-взрослому: удаляем ввод BIN (если получится)
     await try_delete_user_message(update)
 
     await safe_edit_or_send(
@@ -682,16 +708,10 @@ async def cp_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return CP_WAIT_NAME
 
     context.user_data["cp_name"] = cp
-
-    # чистим ввод пользователя
     await try_delete_user_message(update)
 
     tags = await fetch_counterparty_tags(cp, limit=10)
-    marker, details = summarize_tags(tags)
-
-    text = f"🔎 Контрагент: <b>{cp}</b>\n{marker}"
-    if details:
-        text += f"\n\n<b>Последние отметки:</b>\n{details}"
+    text = render_counterparty_card(cp, tags)
 
     await safe_edit_or_send(
         update,
@@ -759,7 +779,6 @@ async def cp_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
     cp = context.user_data.get("cp_name", "")
     color = context.user_data.get("cp_color", "yellow")
 
-    # чистим ввод пользователя
     await try_delete_user_message(update)
 
     emoji = "🟥" if color == "red" else "🟨" if color == "yellow" else "🟩"
@@ -804,11 +823,7 @@ async def cp_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await save_counterparty_tag(cp, color, comment, user.id, user.username)
 
     tags = await fetch_counterparty_tags(cp, limit=10)
-    marker, details = summarize_tags(tags)
-
-    text = f"✅ Сохранено!\n\n🔎 Контрагент: <b>{cp}</b>\n{marker}"
-    if details:
-        text += f"\n\n<b>Последние отметки:</b>\n{details}"
+    text = "✅ <b>Сохранено</b>\n\n" + render_counterparty_card(cp, tags)
 
     await safe_edit_or_send(
         update,
@@ -941,7 +956,6 @@ async def admin_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target = (update.message.text or "").strip()
     action = context.user_data.get("adm_action")
 
-    # чистим ввод пользователя
     await try_delete_user_message(update)
 
     if action == "grant":
@@ -990,7 +1004,7 @@ async def run_bot():
         logger.error("TELEGRAM_TOKEN не найден!")
         return
 
-    # В PTB v20+ при polling вебхук не обязателен. Но оставим мягко:
+    # Мягко сбросим вебхук (на всякий)
     try:
         temp_app = Application.builder().token(token).build()
         await temp_app.bot.delete_webhook(drop_pending_updates=True)
