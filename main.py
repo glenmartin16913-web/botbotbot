@@ -5,7 +5,8 @@ import asyncio
 import zipfile
 import logging
 import re
-from datetime import datetime
+from datetime import datetime, timezone
+from zoneinfo import ZoneInfo
 from typing import Optional, Dict, Any, List, Tuple
 
 from aiohttp import web
@@ -89,7 +90,6 @@ def get_card_scheme(bin_code: str) -> str:
 # -------------------- SUPABASE --------------------
 SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
-
 supabase: Optional[SupabaseClient] = None
 
 
@@ -176,7 +176,7 @@ async def upsert_user_identity(user_id: int, username: Optional[str]) -> None:
     """
     Если пользователь есть в access_list по username — привяжем telegram_id.
     Если есть по telegram_id — обновим username.
-    Ничего не создаём автоматически (чтобы бот оставался закрытым).
+    Ничего не создаём автоматически (бот закрытый).
     """
     if supabase is None:
         return
@@ -184,7 +184,13 @@ async def upsert_user_identity(user_id: int, username: Optional[str]) -> None:
     uname = normalize_username(username)
 
     def _work():
-        res = supabase.table("access_list").select("id, telegram_id, username").limit(1).eq("telegram_id", user_id).execute()
+        res = (
+            supabase.table("access_list")
+            .select("id, telegram_id, username")
+            .limit(1)
+            .eq("telegram_id", user_id)
+            .execute()
+        )
         if res.data:
             row_id = res.data[0]["id"]
             supabase.table("access_list").update(
@@ -193,7 +199,13 @@ async def upsert_user_identity(user_id: int, username: Optional[str]) -> None:
             return
 
         if uname:
-            res2 = supabase.table("access_list").select("id, telegram_id, username").limit(1).ilike("username", uname).execute()
+            res2 = (
+                supabase.table("access_list")
+                .select("id, telegram_id, username")
+                .limit(1)
+                .ilike("username", uname)
+                .execute()
+            )
             if res2.data:
                 row_id = res2.data[0]["id"]
                 supabase.table("access_list").update(
@@ -257,11 +269,11 @@ def confirm_keyboard(prefix: str) -> InlineKeyboardMarkup:
 
 
 def admin_actions_keyboard() -> InlineKeyboardMarkup:
+    # Убрали "Список до 30"
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("✅ Выдать доступ", callback_data="adm:grant")],
             [InlineKeyboardButton("⛔ Забрать доступ", callback_data="adm:revoke")],
-            [InlineKeyboardButton("📋 Список (до 30)", callback_data="adm:list")],
             [InlineKeyboardButton("⬅️ Назад в меню", callback_data="menu:back")],
         ]
     )
@@ -294,7 +306,7 @@ async def safe_edit_or_send(
     parse_mode=ParseMode.HTML,
 ):
     """
-    Если callback_query — редактируем одно и то же сообщение.
+    Если callback_query — редактируем одно сообщение.
     Если обычное сообщение — удаляем прошлое "служебное" сообщение бота и отправляем новое.
     """
     if update.callback_query:
@@ -319,9 +331,64 @@ async def try_delete_user_message(update: Update):
         pass
 
 
+# -------------------- BIN MESSAGE DELAY DELETE + AUTO CLEAN --------------------
+async def cleanup_previous_bin_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Удаляет ПРЕДЫДУЩЕЕ BIN-сообщение пользователя, но оставляет текущее.
+    (Текущее удалится при следующем BIN-запросе)
+    """
+    chat_id = update.effective_chat.id
+    prev_id = context.user_data.get("last_bin_msg_id")
+    if prev_id:
+        await safe_delete_message(context, chat_id, prev_id)
+
+    if update.message:
+        context.user_data["last_bin_msg_id"] = update.message.message_id
+
+
+async def clear_bin_history(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    """Авточистка: удаляем последнее BIN-сообщение, когда уходим в другие разделы."""
+    prev_id = context.user_data.get("last_bin_msg_id")
+    if prev_id:
+        await safe_delete_message(context, chat_id, prev_id)
+    context.user_data["last_bin_msg_id"] = None
+
+
 # -------------------- CONVERSATION STATES --------------------
 CP_WAIT_NAME, CP_WAIT_COLOR, CP_WAIT_COMMENT, CP_WAIT_CONFIRM = range(4)
 ADM_WAIT_ACTION, ADM_WAIT_TARGET = range(2)
+
+# -------------------- TIME FORMAT (MSK) --------------------
+MSK = ZoneInfo("Europe/Moscow")
+
+
+def parse_dt_any(dt_val: Any) -> Optional[datetime]:
+    """Пытаемся распарсить created_at из Supabase (обычно ISO)."""
+    if not dt_val:
+        return None
+    if isinstance(dt_val, datetime):
+        return dt_val
+    if isinstance(dt_val, str):
+        s = dt_val.strip()
+        # supabase часто отдаёт Z в конце
+        if s.endswith("Z"):
+            s = s[:-1] + "+00:00"
+        try:
+            return datetime.fromisoformat(s)
+        except Exception:
+            return None
+    return None
+
+
+def fmt_msk(dt_val: Any) -> str:
+    dt = parse_dt_any(dt_val)
+    if not dt:
+        return ""
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=timezone.utc)
+    dt_msk = dt.astimezone(MSK)
+    return dt_msk.strftime("%d.%m.%Y %H:%M МСК")
+
 
 # -------------------- HELPERS: COUNTERPARTY --------------------
 async def fetch_counterparty_tags(counterparty: str, limit: int = 10) -> List[Dict[str, Any]]:
@@ -370,7 +437,6 @@ def render_counterparty_card(counterparty: str, tags: List[Dict[str, Any]]) -> s
         if c in counts:
             counts[c] += 1
 
-    # Определяем доминирующий цвет
     priority = {"red": 3, "yellow": 2, "green": 1}
     dominant = max(counts.keys(), key=lambda c: (counts[c], priority[c]))
 
@@ -398,7 +464,9 @@ def render_counterparty_card(counterparty: str, tags: List[Dict[str, Any]]) -> s
         comment = (t.get("comment") or "").strip()
         if len(comment) > 160:
             comment = comment[:160] + "…"
-        notes.append(f"{emoji} <b>{author}</b> — {comment}")
+        ts = fmt_msk(t.get("created_at"))
+        ts_part = f" <i>({ts})</i>" if ts else ""
+        notes.append(f"{emoji} <b>{author}</b> — {comment}{ts_part}")
 
     return header + "\n<b>Последние отметки</b>\n" + "\n".join(notes)
 
@@ -407,12 +475,14 @@ async def save_counterparty_tag(counterparty: str, color: str, comment: str, by_
     if supabase is None:
         return
 
+    # сохраняем created_at в UTC (в карточке покажем МСК)
     payload = {
         "counterparty": counterparty.strip().lower(),
         "color": color,
         "comment": comment.strip(),
         "created_by_telegram_id": by_id,
         "created_by_username": normalize_username(by_username),
+        "created_at": datetime.utcnow().replace(tzinfo=timezone.utc).isoformat(),
     }
 
     def _work():
@@ -486,23 +556,6 @@ async def revoke_access(target: str) -> str:
     return "⛔ Доступ отключён."
 
 
-async def list_access(limit: int = 30) -> List[Dict[str, Any]]:
-    if supabase is None:
-        return []
-
-    def _work():
-        res = (
-            supabase.table("access_list")
-            .select("telegram_id,username,role,is_active,created_at")
-            .order("created_at", desc=True)
-            .limit(limit)
-            .execute()
-        )
-        return res.data or []
-
-    return await sb_exec(_work)
-
-
 # -------------------- ACCESS GATE --------------------
 async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tuple[bool, bool]:
     user = update.effective_user
@@ -540,6 +593,9 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await deny(update)
         return
 
+    # Авточистка BIN при старте (чтобы не висело старое)
+    await clear_bin_history(context, update.effective_chat.id)
+
     context.user_data["mode"] = MODE_BIN
 
     await safe_edit_or_send(
@@ -559,6 +615,9 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed:
         await deny(update)
         return
+
+    # Авточистка BIN при входе в помощь
+    await clear_bin_history(context, update.effective_chat.id)
 
     user = update.effective_user
     await safe_edit_or_send(
@@ -599,7 +658,6 @@ async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await help_cmd(update, context)
         return
 
-    # на всякий: ручной вход в админку, если вдруг не словили конверсейшном
     if text == BTN_ADMIN:
         await admin_entry(update, context)
         return
@@ -644,6 +702,9 @@ async def check_card_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
+    # ВАЖНО: удаляем предыдущий BIN, текущее сообщение оставляем
+    await cleanup_previous_bin_message(update, context)
+
     brand = get_card_scheme(bin_code)
     issuer = "Unknown"
     country = "Unknown"
@@ -665,8 +726,6 @@ async def check_card_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except Exception as e:
             logger.warning(f"BINLIST API error: {e}")
 
-    await try_delete_user_message(update)
-
     await safe_edit_or_send(
         update,
         context,
@@ -684,6 +743,9 @@ async def cp_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not allowed:
         await deny(update)
         return ConversationHandler.END
+
+    # Авточистка BIN при входе в контрагентов
+    await clear_bin_history(context, update.effective_chat.id)
 
     context.user_data["mode"] = MODE_NONE
     await safe_edit_or_send(
@@ -884,6 +946,9 @@ async def admin_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_or_send(update, context, "⛔ Эта функция доступна только администраторам.", parse_mode=None)
         return ConversationHandler.END
 
+    # Авточистка BIN при входе в админку
+    await clear_bin_history(context, update.effective_chat.id)
+
     context.user_data["mode"] = MODE_NONE
 
     await safe_edit_or_send(
@@ -910,29 +975,6 @@ async def admin_action_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     action = q.data.split(":")[-1]
     context.user_data["adm_action"] = action
-
-    if action == "list":
-        rows = await list_access(30)
-        if not rows:
-            await safe_edit_or_send(update, context, "Список пуст.", reply_markup=admin_actions_keyboard(), parse_mode=None)
-            return ADM_WAIT_ACTION
-
-        lines = []
-        for r in rows:
-            uname = r.get("username") or "-"
-            tid = r.get("telegram_id") or "-"
-            role = r.get("role") or "user"
-            active = "✅" if r.get("is_active") else "⛔"
-            lines.append(f"{active} @{uname} | id:{tid} | {role}")
-
-        await safe_edit_or_send(
-            update,
-            context,
-            "📋 <b>Access list</b>:\n" + "\n".join(lines),
-            reply_markup=admin_actions_keyboard(),
-            parse_mode=ParseMode.HTML,
-        )
-        return ADM_WAIT_ACTION
 
     await safe_edit_or_send(
         update,
@@ -1053,7 +1095,7 @@ async def run_bot():
         entry_points=[MessageHandler(filters.Regex(adm_entry_pattern), admin_entry)],
         states={
             ADM_WAIT_ACTION: [
-                CallbackQueryHandler(admin_action_cb, pattern=r"^adm:(grant|revoke|list)$"),
+                CallbackQueryHandler(admin_action_cb, pattern=r"^adm:(grant|revoke)$"),
                 CallbackQueryHandler(back_to_menu_cb, pattern=r"^menu:back$"),
             ],
             ADM_WAIT_TARGET: [
@@ -1066,7 +1108,7 @@ async def run_bot():
     )
     application.add_handler(adm_conv)
 
-    # Кнопки меню BIN/HELP/ADMIN (на случай, если не вошли в конверсейшн)
+    # Кнопки меню BIN/HELP/ADMIN (CP ловит conversation entry)
     menu_pattern = rf"^({re.escape(BTN_BIN)}|{re.escape(BTN_HELP)}|{re.escape(BTN_ADMIN)})$"
     application.add_handler(MessageHandler(filters.Regex(menu_pattern), on_menu_button))
 
