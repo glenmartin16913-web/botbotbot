@@ -4,6 +4,7 @@ import aiohttp
 import asyncio
 import zipfile
 import logging
+import re
 from datetime import datetime
 from typing import Optional, Dict, Any, List, Tuple
 
@@ -28,6 +29,7 @@ from telegram.ext import (
 
 from supabase import create_client, Client as SupabaseClient
 
+
 # -------------------- LOGGING --------------------
 logging.basicConfig(
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
@@ -37,6 +39,7 @@ logger = logging.getLogger("bin_bot")
 
 # -------------------- BIN DB --------------------
 bin_db: Dict[str, Dict[str, str]] = {}
+
 
 def load_db() -> bool:
     """Загрузка базы BIN-кодов из ZIP-архива"""
@@ -88,6 +91,7 @@ SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
 
 supabase: Optional[SupabaseClient] = None
+
 
 def init_supabase() -> bool:
     global supabase
@@ -141,14 +145,18 @@ async def is_allowed_user(user_id: int, username: Optional[str]) -> Tuple[bool, 
     uname = normalize_username(username)
 
     def _query_access():
-        # Пытаемся найти по telegram_id, если нет — по username
         q = supabase.table("access_list").select("telegram_id, username, role, is_active").limit(1)
         res = q.eq("telegram_id", user_id).execute()
         if res.data:
             return res.data[0]
         if uname:
-            res2 = supabase.table("access_list").select("telegram_id, username, role, is_active").limit(1)\
-                .ilike("username", uname).execute()
+            res2 = (
+                supabase.table("access_list")
+                .select("telegram_id, username, role, is_active")
+                .limit(1)
+                .ilike("username", uname)
+                .execute()
+            )
             if res2.data:
                 return res2.data[0]
         return None
@@ -176,25 +184,21 @@ async def upsert_user_identity(user_id: int, username: Optional[str]) -> None:
     uname = normalize_username(username)
 
     def _work():
-        # 1) по telegram_id
         res = supabase.table("access_list").select("id, telegram_id, username").limit(1).eq("telegram_id", user_id).execute()
         if res.data:
             row_id = res.data[0]["id"]
-            supabase.table("access_list").update({
-                "username": uname,
-                "updated_at": datetime.utcnow().isoformat()
-            }).eq("id", row_id).execute()
+            supabase.table("access_list").update(
+                {"username": uname, "updated_at": datetime.utcnow().isoformat()}
+            ).eq("id", row_id).execute()
             return
 
-        # 2) по username
         if uname:
             res2 = supabase.table("access_list").select("id, telegram_id, username").limit(1).ilike("username", uname).execute()
             if res2.data:
                 row_id = res2.data[0]["id"]
-                supabase.table("access_list").update({
-                    "telegram_id": user_id,
-                    "updated_at": datetime.utcnow().isoformat()
-                }).eq("id", row_id).execute()
+                supabase.table("access_list").update(
+                    {"telegram_id": user_id, "updated_at": datetime.utcnow().isoformat()}
+                ).eq("id", row_id).execute()
 
     await sb_exec(_work)
 
@@ -202,11 +206,12 @@ async def upsert_user_identity(user_id: int, username: Optional[str]) -> None:
 # -------------------- UI / MENUS --------------------
 BTN_BIN = "💳 Проверка карты"
 BTN_CP = "👤 Контр агенты"
-BTN_ADMIN = "⚙️ Доступ (админ)"
+BTN_ADMIN = "⚙️ Доступ Админ"
 BTN_HELP = "ℹ️ Помощь"
 
 MODE_BIN = "bin"
 MODE_NONE = "none"
+
 
 def main_keyboard(is_admin: bool) -> ReplyKeyboardMarkup:
     rows = [
@@ -219,39 +224,99 @@ def main_keyboard(is_admin: bool) -> ReplyKeyboardMarkup:
 
 
 def cp_actions_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("➕ Добавить тег", callback_data="cp:add")],
-        [InlineKeyboardButton("⬅️ Назад в меню", callback_data="menu:back")],
-    ])
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("➕ Добавить тег", callback_data="cp:add")],
+            [InlineKeyboardButton("⬅️ Назад в меню", callback_data="menu:back")],
+        ]
+    )
 
 
 def cp_color_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton("🟥 Красный", callback_data="cp:color:red"),
-            InlineKeyboardButton("🟨 Жёлтый", callback_data="cp:color:yellow"),
-            InlineKeyboardButton("🟩 Зелёный", callback_data="cp:color:green"),
-        ],
-        [InlineKeyboardButton("⬅️ Отмена", callback_data="cp:cancel")],
-    ])
+            [
+                InlineKeyboardButton("🟥 Красный", callback_data="cp:color:red"),
+                InlineKeyboardButton("🟨 Жёлтый", callback_data="cp:color:yellow"),
+                InlineKeyboardButton("🟩 Зелёный", callback_data="cp:color:green"),
+            ],
+            [InlineKeyboardButton("⬅️ Отмена", callback_data="cp:cancel")],
+        ]
+    )
 
 
 def confirm_keyboard(prefix: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
+    return InlineKeyboardMarkup(
         [
-            InlineKeyboardButton("✅ Подтвердить", callback_data=f"{prefix}:yes"),
-            InlineKeyboardButton("❌ Отмена", callback_data=f"{prefix}:no"),
+            [
+                InlineKeyboardButton("✅ Подтвердить", callback_data=f"{prefix}:yes"),
+                InlineKeyboardButton("❌ Отмена", callback_data=f"{prefix}:no"),
+            ]
         ]
-    ])
+    )
 
 
 def admin_actions_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup([
-        [InlineKeyboardButton("✅ Выдать доступ", callback_data="adm:grant")],
-        [InlineKeyboardButton("⛔ Забрать доступ", callback_data="adm:revoke")],
-        [InlineKeyboardButton("📋 Список (до 30)", callback_data="adm:list")],
-        [InlineKeyboardButton("⬅️ Назад в меню", callback_data="menu:back")],
-    ])
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("✅ Выдать доступ", callback_data="adm:grant")],
+            [InlineKeyboardButton("⛔ Забрать доступ", callback_data="adm:revoke")],
+            [InlineKeyboardButton("📋 Список (до 30)", callback_data="adm:list")],
+            [InlineKeyboardButton("⬅️ Назад в меню", callback_data="menu:back")],
+        ]
+    )
+
+
+# -------------------- CLEAN UI HELPERS --------------------
+async def safe_delete_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int, message_id: int):
+    try:
+        await context.bot.delete_message(chat_id=chat_id, message_id=message_id)
+    except Exception:
+        pass
+
+
+async def remember_bot_message(context: ContextTypes.DEFAULT_TYPE, message_id: int):
+    context.user_data["last_bot_msg_id"] = message_id
+
+
+async def cleanup_previous_bot_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    mid = context.user_data.get("last_bot_msg_id")
+    if mid:
+        await safe_delete_message(context, chat_id, mid)
+        context.user_data["last_bot_msg_id"] = None
+
+
+async def safe_edit_or_send(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+    text: str,
+    reply_markup=None,
+    parse_mode=ParseMode.HTML,
+):
+    """
+    Если callback_query — редактируем одно и то же сообщение (красиво).
+    Если обычное сообщение — удаляем прошлое "служебное" сообщение бота и отправляем новое.
+    """
+    if update.callback_query:
+        q = update.callback_query
+        try:
+            await q.message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        except Exception:
+            m = await q.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+            await remember_bot_message(context, m.message_id)
+    else:
+        chat_id = update.effective_chat.id
+        await cleanup_previous_bot_message(context, chat_id)
+        m = await update.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+        await remember_bot_message(context, m.message_id)
+
+
+async def try_delete_user_message(update: Update):
+    try:
+        if update.message:
+            await update.message.delete()
+    except Exception:
+        pass
 
 
 # -------------------- CONVERSATION STATES --------------------
@@ -267,23 +332,20 @@ async def fetch_counterparty_tags(counterparty: str, limit: int = 10) -> List[Di
         return []
 
     def _work():
-        res = supabase.table("counterparty_tags") \
-            .select("id,counterparty,color,comment,created_by_username,created_by_telegram_id,created_at") \
-            .ilike("counterparty", key.lower()) \
-            .order("created_at", desc=True) \
-            .limit(limit) \
+        res = (
+            supabase.table("counterparty_tags")
+            .select("id,counterparty,color,comment,created_by_username,created_by_telegram_id,created_at")
+            .ilike("counterparty", key.lower())
+            .order("created_at", desc=True)
+            .limit(limit)
             .execute()
+        )
         return res.data or []
 
     return await sb_exec(_work)
 
 
 def summarize_tags(tags: List[Dict[str, Any]]) -> Tuple[str, str]:
-    """
-    Возвращает (marker_line, details_block)
-    marker_line: общий индикатор
-    details_block: последние записи
-    """
     if not tags:
         return "🏷️ Тегов пока нет.", ""
 
@@ -293,15 +355,12 @@ def summarize_tags(tags: List[Dict[str, Any]]) -> Tuple[str, str]:
         if c in counts:
             counts[c] += 1
 
-    # "маркер" как самый частый цвет (при равенстве — красный>жёлтый>зелёный)
     order = [("red", "🟥"), ("yellow", "🟨"), ("green", "🟩")]
+    # самый частый; при равенстве — красный > жёлтый > зелёный
     marker_color = max(order, key=lambda x: (counts[x[0]], -order.index(x)))[0]
     marker_emoji = dict(order).get(marker_color, "🏷️")
 
-    marker_line = (
-        f"{marker_emoji} Маркер: "
-        f"🟥{counts['red']}  🟨{counts['yellow']}  🟩{counts['green']}"
-    )
+    marker_line = f"{marker_emoji} Маркер: 🟥{counts['red']}  🟨{counts['yellow']}  🟩{counts['green']}"
 
     lines = []
     for t in tags[:7]:
@@ -337,9 +396,6 @@ async def save_counterparty_tag(counterparty: str, color: str, comment: str, by_
 
 # -------------------- HELPERS: ACCESS --------------------
 async def grant_access(target: str, role: str = "user") -> str:
-    """
-    target: @username или число (telegram_id)
-    """
     if supabase is None:
         return "❌ Supabase не настроен."
 
@@ -358,25 +414,21 @@ async def grant_access(target: str, role: str = "user") -> str:
             "is_active": True,
             "updated_at": datetime.utcnow().isoformat(),
         }
-        # upsert по telegram_id или username (уникальные индексы частичные — поэтому делаем вручную)
+
         if tid is not None:
-            # ищем по telegram_id
             res = supabase.table("access_list").select("id").limit(1).eq("telegram_id", tid).execute()
             if res.data:
                 supabase.table("access_list").update(data).eq("id", res.data[0]["id"]).execute()
                 return "updated_by_id"
-            else:
-                supabase.table("access_list").insert(data).execute()
-                return "inserted_by_id"
+            supabase.table("access_list").insert(data).execute()
+            return "inserted_by_id"
 
-        # по username
         res2 = supabase.table("access_list").select("id").limit(1).ilike("username", uname).execute()
         if res2.data:
             supabase.table("access_list").update(data).eq("id", res2.data[0]["id"]).execute()
             return "updated_by_username"
-        else:
-            supabase.table("access_list").insert(data).execute()
-            return "inserted_by_username"
+        supabase.table("access_list").insert(data).execute()
+        return "inserted_by_username"
 
     status = await sb_exec(_work)
     return f"✅ Доступ выдан ({status})."
@@ -394,26 +446,33 @@ async def revoke_access(target: str) -> str:
         return "❌ Укажи @username или telegram_id числом."
 
     def _work():
-        q = supabase.table("access_list")
         if tid is not None:
-            q.update({"is_active": False, "updated_at": datetime.utcnow().isoformat()}).eq("telegram_id", tid).execute()
+            supabase.table("access_list").update(
+                {"is_active": False, "updated_at": datetime.utcnow().isoformat()}
+            ).eq("telegram_id", tid).execute()
             return
-        q.update({"is_active": False, "updated_at": datetime.utcnow().isoformat()}).ilike("username", uname).execute()
+        supabase.table("access_list").update(
+            {"is_active": False, "updated_at": datetime.utcnow().isoformat()}
+        ).ilike("username", uname).execute()
 
     await sb_exec(_work)
-    return "⛔ Доступ отключён (is_active=false)."
+    return "⛔ Доступ отключён."
 
 
 async def list_access(limit: int = 30) -> List[Dict[str, Any]]:
     if supabase is None:
         return []
+
     def _work():
-        res = supabase.table("access_list") \
-            .select("telegram_id,username,role,is_active,created_at") \
-            .order("created_at", desc=True) \
-            .limit(limit) \
+        res = (
+            supabase.table("access_list")
+            .select("telegram_id,username,role,is_active,created_at")
+            .order("created_at", desc=True)
+            .limit(limit)
             .execute()
+        )
         return res.data or []
+
     return await sb_exec(_work)
 
 
@@ -425,7 +484,6 @@ async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tuple[bool
 
     allowed, is_admin = await is_allowed_user(user.id, user.username)
 
-    # Если найден по username — привяжем telegram_id
     if allowed:
         await upsert_user_identity(user.id, user.username)
 
@@ -434,11 +492,12 @@ async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tuple[bool
 
 
 async def deny(update: Update):
-    # Пытаемся ответить корректно и для сообщений, и для callback_query
     msg = (
-        "⛔ Бот закрытый.\n\n"
-        "У тебя нет доступа. Напиши администратору, чтобы он выдал доступ.\n"
-        "Если админ хочет выдать доступ заранее — добавьте твоё @username в базу доступа."
+        "⛔️ Бот закрытый.\n\n"
+        "Чтобы получить доступ напиши одному из администраторов:\n"
+        "@GoldExSenior\n"
+        "@GoldexDigital\n"
+        "@GoldEx69"
     )
     if update.message:
         await update.message.reply_text(msg)
@@ -456,12 +515,15 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     context.user_data["mode"] = MODE_BIN
 
-    await update.message.reply_text(
+    await safe_edit_or_send(
+        update,
+        context,
         "Привет! Выбери режим кнопками ниже.\n\n"
         "💳 <b>Проверка карты</b>: отправь первые 6 цифр (BIN)\n"
-        "👤 <b>Контр агенты</b>: поиск тега по нику + добавление тега\n",
-        parse_mode=ParseMode.HTML,
+        "👤 <b>Контр агенты</b>: поиск тега по нику + добавление тега\n"
+        + ("⚙️ <b>Доступ</b>: управление доступами (админ)\n" if is_admin else ""),
         reply_markup=main_keyboard(is_admin),
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -472,15 +534,17 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return
 
     user = update.effective_user
-    await update.message.reply_text(
+    await safe_edit_or_send(
+        update,
+        context,
         "ℹ️ <b>Помощь</b>\n\n"
         f"Твой Telegram ID: <code>{user.id}</code>\n"
         f"Твой username: <code>@{user.username or 'нет'}</code>\n\n"
-        "💳 Проверка BIN: просто отправь 6 цифр.\n"
-        "👤 Контр агенты: нажми кнопку и следуй шагам.\n"
-        + ("⚙️ Доступ: админ-меню доступов.\n" if is_admin else ""),
-        parse_mode=ParseMode.HTML,
+        "💳 Проверка BIN: отправь 6 цифр.\n"
+        "👤 Контр агенты: найди контрагента и добавь тег.\n"
+        + ("⚙️ Доступ: выдача/забор доступа.\n" if is_admin else ""),
         reply_markup=main_keyboard(is_admin),
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -495,10 +559,12 @@ async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     if text == BTN_BIN:
         context.user_data["mode"] = MODE_BIN
-        await update.message.reply_text(
+        await safe_edit_or_send(
+            update,
+            context,
             "💳 Режим проверки карты.\nОтправь первые 6 цифр BIN (пример: <code>424242</code>).",
-            parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard(is_admin),
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -506,11 +572,17 @@ async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await help_cmd(update, context)
         return
 
-    # Контр-агенты и админ-доступ идут через ConversationHandler,
-    # поэтому тут ничего не делаем.
-    await update.message.reply_text(
+    # Если почему-то не попали в ConversationHandler — вручную откроем админку
+    if text == BTN_ADMIN:
+        await admin_entry(update, context)
+        return
+
+    await safe_edit_or_send(
+        update,
+        context,
         "Выбери действие кнопками меню 🙂",
         reply_markup=main_keyboard(is_admin),
+        parse_mode=None,
     )
 
 
@@ -524,20 +596,24 @@ async def check_card_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
     mode = context.user_data.get("mode", MODE_BIN)
     text = (update.message.text or "").strip()
 
-    # Если не в режиме BIN — не ругаемся "неправильный формат", а мягко направляем.
     if mode != MODE_BIN:
-        await update.message.reply_text(
+        await safe_edit_or_send(
+            update,
+            context,
             "Сейчас ты не в режиме проверки карты.\nНажми «💳 Проверка карты» или «👤 Контр агенты».",
             reply_markup=main_keyboard(is_admin),
+            parse_mode=None,
         )
         return
 
     bin_code = text[:6] if text.isdigit() else ""
     if not bin_code or len(bin_code) < 6:
-        await update.message.reply_text(
+        await safe_edit_or_send(
+            update,
+            context,
             "❌ Нужно 6 цифр BIN. Пример: <code>424242</code>",
-            parse_mode=ParseMode.HTML,
             reply_markup=main_keyboard(is_admin),
+            parse_mode=ParseMode.HTML,
         )
         return
 
@@ -562,12 +638,17 @@ async def check_card_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
         except Exception as e:
             logger.warning(f"BINLIST API error: {e}")
 
-    await update.message.reply_text(
+    # по-взрослому: удаляем ввод BIN (если получится)
+    await try_delete_user_message(update)
+
+    await safe_edit_or_send(
+        update,
+        context,
         f"💳 <b>Платёжная система</b>: {brand}\n"
         f"🏦 <b>Банк</b>: {issuer}\n"
         f"🌍 <b>Страна</b>: {country}",
-        parse_mode=ParseMode.HTML,
         reply_markup=main_keyboard(is_admin),
+        parse_mode=ParseMode.HTML,
     )
 
 
@@ -579,26 +660,31 @@ async def cp_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     context.user_data["mode"] = MODE_NONE
-    await update.message.reply_text(
+    await safe_edit_or_send(
+        update,
+        context,
         "👤 <b>Контр агенты</b>\n\nОтправь имя контрагента (ник) как на бирже:",
-        parse_mode=ParseMode.HTML,
         reply_markup=main_keyboard(is_admin),
+        parse_mode=ParseMode.HTML,
     )
     return CP_WAIT_NAME
 
 
 async def cp_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    allowed, is_admin = await gate(update, context)
+    allowed, _ = await gate(update, context)
     if not allowed:
         await deny(update)
         return ConversationHandler.END
 
     cp = (update.message.text or "").strip()
     if not cp:
-        await update.message.reply_text("Напиши ник контрагента текстом.")
+        await safe_edit_or_send(update, context, "Напиши ник контрагента текстом.", parse_mode=None)
         return CP_WAIT_NAME
 
     context.user_data["cp_name"] = cp
+
+    # чистим ввод пользователя
+    await try_delete_user_message(update)
 
     tags = await fetch_counterparty_tags(cp, limit=10)
     marker, details = summarize_tags(tags)
@@ -607,10 +693,12 @@ async def cp_receive_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if details:
         text += f"\n\n<b>Последние отметки:</b>\n{details}"
 
-    await update.message.reply_text(
+    await safe_edit_or_send(
+        update,
+        context,
         text,
-        parse_mode=ParseMode.HTML,
         reply_markup=cp_actions_keyboard(),
+        parse_mode=ParseMode.HTML,
     )
     return CP_WAIT_NAME
 
@@ -624,9 +712,12 @@ async def cp_add_tag_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
-    await q.message.reply_text(
+    await safe_edit_or_send(
+        update,
+        context,
         "Выбери цвет тега:",
         reply_markup=cp_color_keyboard(),
+        parse_mode=None,
     )
     return CP_WAIT_COLOR
 
@@ -640,12 +731,15 @@ async def cp_color_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
-    data = q.data  # cp:color:red
-    _, _, color = data.split(":")
+    _, _, color = q.data.split(":")
     context.user_data["cp_color"] = color
 
-    await q.message.reply_text(
+    await safe_edit_or_send(
+        update,
+        context,
         "Напиши комментарий для этого тега:",
+        reply_markup=None,
+        parse_mode=None,
     )
     return CP_WAIT_COMMENT
 
@@ -658,21 +752,26 @@ async def cp_comment(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     comment = (update.message.text or "").strip()
     if len(comment) < 2:
-        await update.message.reply_text("Комментарий слишком короткий. Напиши чуть подробнее.")
+        await safe_edit_or_send(update, context, "Комментарий слишком короткий. Напиши чуть подробнее.", parse_mode=None)
         return CP_WAIT_COMMENT
 
     context.user_data["cp_comment"] = comment
     cp = context.user_data.get("cp_name", "")
     color = context.user_data.get("cp_color", "yellow")
 
+    # чистим ввод пользователя
+    await try_delete_user_message(update)
+
     emoji = "🟥" if color == "red" else "🟨" if color == "yellow" else "🟩"
-    await update.message.reply_text(
+    await safe_edit_or_send(
+        update,
+        context,
         "Проверь и подтверди:\n\n"
         f"Контрагент: <b>{cp}</b>\n"
         f"Тег: {emoji} <b>{color}</b>\n"
         f"Комментарий: <i>{comment}</i>",
-        parse_mode=ParseMode.HTML,
         reply_markup=confirm_keyboard("cp:confirm"),
+        parse_mode=ParseMode.HTML,
     )
     return CP_WAIT_CONFIRM
 
@@ -686,9 +785,15 @@ async def cp_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
-    decision = q.data.split(":")[-1]  # yes/no
+    decision = q.data.split(":")[-1]
     if decision == "no":
-        await q.message.reply_text("Ок, отменено. Можешь снова выбрать «➕ Добавить тег» или вернуться в меню.")
+        await safe_edit_or_send(
+            update,
+            context,
+            "Ок, отменено. Можешь снова нажать «➕ Добавить тег» или вернуться в меню.",
+            reply_markup=cp_actions_keyboard(),
+            parse_mode=None,
+        )
         return CP_WAIT_NAME
 
     cp = context.user_data.get("cp_name", "").strip()
@@ -705,10 +810,12 @@ async def cp_confirm_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if details:
         text += f"\n\n<b>Последние отметки:</b>\n{details}"
 
-    await q.message.reply_text(
+    await safe_edit_or_send(
+        update,
+        context,
         text,
-        parse_mode=ParseMode.HTML,
         reply_markup=cp_actions_keyboard(),
+        parse_mode=ParseMode.HTML,
     )
     return CP_WAIT_NAME
 
@@ -721,9 +828,13 @@ async def cp_cancel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     q = update.callback_query
     await q.answer()
-    await q.message.reply_text(
+
+    await safe_edit_or_send(
+        update,
+        context,
         "Ок, отменено.",
         reply_markup=main_keyboard(is_admin),
+        parse_mode=None,
     )
     return CP_WAIT_NAME
 
@@ -736,10 +847,14 @@ async def back_to_menu_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     q = update.callback_query
     await q.answer()
+
     context.user_data["mode"] = MODE_BIN
-    await q.message.reply_text(
+    await safe_edit_or_send(
+        update,
+        context,
         "⬅️ Возврат в меню. Режим проверки карты активен.",
         reply_markup=main_keyboard(is_admin),
+        parse_mode=None,
     )
     return ConversationHandler.END
 
@@ -751,14 +866,17 @@ async def admin_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await deny(update)
         return ConversationHandler.END
     if not is_admin:
-        await update.message.reply_text("⛔ Эта функция доступна только администраторам.")
+        await safe_edit_or_send(update, context, "⛔ Эта функция доступна только администраторам.", parse_mode=None)
         return ConversationHandler.END
 
     context.user_data["mode"] = MODE_NONE
-    await update.message.reply_text(
+
+    await safe_edit_or_send(
+        update,
+        context,
         "⚙️ <b>Доступ</b>\nВыбери действие:",
-        parse_mode=ParseMode.HTML,
         reply_markup=admin_actions_keyboard(),
+        parse_mode=ParseMode.HTML,
     )
     return ADM_WAIT_ACTION
 
@@ -775,13 +893,13 @@ async def admin_action_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     q = update.callback_query
     await q.answer()
 
-    action = q.data.split(":")[-1]  # grant / revoke / list
+    action = q.data.split(":")[-1]
     context.user_data["adm_action"] = action
 
     if action == "list":
         rows = await list_access(30)
         if not rows:
-            await q.message.reply_text("Список пуст.")
+            await safe_edit_or_send(update, context, "Список пуст.", reply_markup=admin_actions_keyboard(), parse_mode=None)
             return ADM_WAIT_ACTION
 
         lines = []
@@ -792,14 +910,21 @@ async def admin_action_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
             active = "✅" if r.get("is_active") else "⛔"
             lines.append(f"{active} @{uname} | id:{tid} | {role}")
 
-        await q.message.reply_text(
+        await safe_edit_or_send(
+            update,
+            context,
             "📋 <b>Access list</b>:\n" + "\n".join(lines),
+            reply_markup=admin_actions_keyboard(),
             parse_mode=ParseMode.HTML,
         )
         return ADM_WAIT_ACTION
 
-    await q.message.reply_text(
+    await safe_edit_or_send(
+        update,
+        context,
         "Введи @username (без пробелов) или telegram_id числом:",
+        reply_markup=None,
+        parse_mode=None,
     )
     return ADM_WAIT_TARGET
 
@@ -816,17 +941,20 @@ async def admin_target(update: Update, context: ContextTypes.DEFAULT_TYPE):
     target = (update.message.text or "").strip()
     action = context.user_data.get("adm_action")
 
+    # чистим ввод пользователя
+    await try_delete_user_message(update)
+
     if action == "grant":
         msg = await grant_access(target, role="user")
-        await update.message.reply_text(msg)
+        await safe_edit_or_send(update, context, msg, reply_markup=admin_actions_keyboard(), parse_mode=None)
         return ADM_WAIT_ACTION
 
     if action == "revoke":
         msg = await revoke_access(target)
-        await update.message.reply_text(msg)
+        await safe_edit_or_send(update, context, msg, reply_markup=admin_actions_keyboard(), parse_mode=None)
         return ADM_WAIT_ACTION
 
-    await update.message.reply_text("Не понял действие. Вернись в «⚙️ Доступ (админ)» и выбери снова.")
+    await safe_edit_or_send(update, context, "Не понял действие. Вернись в меню «Доступ» и выбери снова.", parse_mode=None)
     return ConversationHandler.END
 
 
@@ -862,24 +990,26 @@ async def run_bot():
         logger.error("TELEGRAM_TOKEN не найден!")
         return
 
-    # Сброс старых вебхуков
-    temp_app = Application.builder().token(token).build()
-    await temp_app.bot.delete_webhook(drop_pending_updates=True)
-    await temp_app.shutdown()
-    await asyncio.sleep(1)
+    # В PTB v20+ при polling вебхук не обязателен. Но оставим мягко:
+    try:
+        temp_app = Application.builder().token(token).build()
+        await temp_app.bot.delete_webhook(drop_pending_updates=True)
+        await temp_app.shutdown()
+        await asyncio.sleep(0.5)
+    except Exception:
+        pass
 
     port = int(os.environ.get("PORT", 8080))
     http_runner = await run_http_server(port)
 
     application = Application.builder().token(token).concurrent_updates(False).build()
 
-    # Команды
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_cmd))
 
-    # Conversation: Контрагенты
+    # Conversation: Контр агенты
     cp_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex(f"^{BTN_CP}$"), cp_entry)],
+        entry_points=[MessageHandler(filters.Regex(rf"^{re.escape(BTN_CP)}$"), cp_entry)],
         states={
             CP_WAIT_NAME: [
                 CallbackQueryHandler(cp_add_tag_cb, pattern=r"^cp:add$"),
@@ -903,9 +1033,10 @@ async def run_bot():
     )
     application.add_handler(cp_conv)
 
-    # Conversation: Админ доступ
+    # Conversation: Админ доступ (ловим разные варианты текста)
+    adm_entry_pattern = rf"^({re.escape(BTN_ADMIN)}|⚙️\s*Доступ\s*\(админ\)|Доступ\s*Админ)$"
     adm_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex(f"^{BTN_ADMIN}$"), admin_entry)],
+        entry_points=[MessageHandler(filters.Regex(adm_entry_pattern), admin_entry)],
         states={
             ADM_WAIT_ACTION: [
                 CallbackQueryHandler(admin_action_cb, pattern=r"^adm:(grant|revoke|list)$"),
@@ -921,10 +1052,11 @@ async def run_bot():
     )
     application.add_handler(adm_conv)
 
-    # Обработка кнопок меню BIN/HELP
-    application.add_handler(MessageHandler(filters.Regex(f"^({BTN_BIN}|{BTN_HELP})$"), on_menu_button))
+    # Кнопки меню BIN/HELP/ADMIN (на случай, если не вошли в конверсейшн)
+    menu_pattern = rf"^({re.escape(BTN_BIN)}|{re.escape(BTN_HELP)}|{re.escape(BTN_ADMIN)})$"
+    application.add_handler(MessageHandler(filters.Regex(menu_pattern), on_menu_button))
 
-    # BIN-чек (только если режим BIN)
+    # BIN-чек
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, check_card_message))
 
     logger.info("Бот запускается...")
