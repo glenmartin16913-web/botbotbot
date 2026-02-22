@@ -51,7 +51,7 @@ _ACCESS_TTL = float(os.getenv("ACCESS_CACHE_TTL", "30"))  # секунд
 _BINLIST_CACHE: Dict[str, Tuple[float, Tuple[str, str]]] = {}
 _BINLIST_TTL = float(os.getenv("BINLIST_CACHE_TTL", str(24 * 3600)))  # секунд
 
-# Сессия HTTP для всех запросов (binlist + можно расширять)
+# Сессия HTTP для всех запросов
 HTTP_SESSION: Optional[aiohttp.ClientSession] = None
 
 # -------------------- BIN DB --------------------
@@ -134,9 +134,9 @@ def normalize_username(u: Optional[str]) -> Optional[str]:
     return u.lower() if u else None
 
 
-def parse_admin_ids() -> set:
+def parse_admin_ids() -> set[int]:
     raw = (os.getenv("ADMIN_IDS") or "").strip()
-    ids = set()
+    ids: set[int] = set()
     for part in raw.split(","):
         p = part.strip()
         if p.isdigit():
@@ -150,10 +150,7 @@ ADMIN_IDS = parse_admin_ids()
 async def is_allowed_user(user_id: int, username: Optional[str]) -> Tuple[bool, bool]:
     """
     Возвращает (allowed, is_admin).
-    Admin = либо в ADMIN_IDS, либо в access_list.role='admin' и is_active=true
-    Allowed = либо admin, либо access_list.is_active=true
-
-    Оптимизация: TTL-кэш на 30 сек (по умолчанию).
+    Оптимизация: TTL-кэш (по умолчанию 30 секунд).
     """
     if user_id in ADMIN_IDS:
         return True, True
@@ -204,7 +201,6 @@ async def upsert_user_identity(user_id: int, username: Optional[str]) -> None:
     """
     Если пользователь есть в access_list по username — привяжем telegram_id.
     Если есть по telegram_id — обновим username.
-    Ничего не создаём автоматически (бот закрытый).
     """
     if supabase is None:
         return
@@ -299,9 +295,18 @@ def confirm_keyboard(prefix: str) -> InlineKeyboardMarkup:
 def admin_actions_keyboard() -> InlineKeyboardMarkup:
     return InlineKeyboardMarkup(
         [
-            [InlineKeyboardButton("✅ Выдать доступ", callback_data="adm:grant")],
-            [InlineKeyboardButton("⛔ Забрать доступ", callback_data="adm:revoke")],
-            [InlineKeyboardButton("⬅️ Назад в меню", callback_data="menu:back")],
+            [InlineKeyboardButton("👌 Выдать доступ", callback_data="adm:grant")],
+            [InlineKeyboardButton("🛑 Забрать доступ", callback_data="adm:revoke")],
+            [InlineKeyboardButton("🏠 В меню", callback_data="menu:back")],
+        ]
+    )
+
+
+def admin_target_keyboard() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(
+        [
+            [InlineKeyboardButton("❌ Отмена", callback_data="adm:cancel")],
+            [InlineKeyboardButton("🏠 В меню", callback_data="menu:back")],
         ]
     )
 
@@ -326,8 +331,8 @@ async def safe_edit_or_send(
     parse_mode=ParseMode.HTML,
 ):
     """
-    Оптимизация: в личных сообщениях стараемся редактировать одно и то же "служебное"
-    сообщение бота вместо удаления/создания нового (меньше запросов к Telegram API).
+    Оптимизация: пытаемся редактировать одно "служебное" сообщение бота
+    вместо удаления/создания нового (меньше запросов к Telegram API).
     """
     if update.callback_query:
         q = update.callback_query
@@ -373,7 +378,6 @@ async def try_delete_user_message(update: Update):
 async def cleanup_previous_bin_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """
     Удаляет ПРЕДЫДУЩЕЕ BIN-сообщение пользователя, но оставляет текущее.
-    (Текущее удалится при следующем BIN-запросе)
     """
     chat_id = update.effective_chat.id
     prev_id = context.user_data.get("last_bin_msg_id")
@@ -401,7 +405,6 @@ MSK = ZoneInfo("Europe/Moscow")
 
 
 def parse_dt_any(dt_val: Any) -> Optional[datetime]:
-    """Пытаемся распарсить created_at из Supabase (обычно ISO)."""
     if not dt_val:
         return None
     if isinstance(dt_val, datetime):
@@ -450,6 +453,9 @@ async def fetch_counterparty_tags(counterparty: str, limit: int = 10) -> List[Di
 
 
 def render_counterparty_card(counterparty: str, tags: List[Dict[str, Any]]) -> str:
+    """
+    Цвета/иконки контрагентов НЕ меняем (🟥🟨🟩).
+    """
     cp = counterparty.strip()
 
     if not tags:
@@ -598,7 +604,7 @@ async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tuple[bool
 
     allowed, is_admin = await is_allowed_user(user.id, user.username)
 
-    # Оптимизация: upsert identity не блокирует ответ и не чаще N секунд
+    # upsert identity не блокирует ответ и не чаще N секунд
     if allowed:
         last = float(context.user_data.get("_last_id_upsert_at", 0.0) or 0.0)
         now = monotonic()
@@ -641,10 +647,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_edit_or_send(
         update,
         context,
-        "Привет! Выбери режим кнопками ниже.\n\n"
+        "👋 Привет! Выбери режим кнопками ниже.\n\n"
         "💳 <b>Проверка карты</b>: отправь первые 6 цифр (BIN)\n"
         "👤 <b>Контр агенты</b>: поиск тега по нику + добавление тега\n"
-        + ("⚙️ <b>Доступ</b>: управление доступами (админ)\n" if is_admin else ""),
+        + ("🛡️ <b>Доступ</b>: управление доступами (админ)\n" if is_admin else ""),
         reply_markup=main_keyboard(is_admin),
         parse_mode=ParseMode.HTML,
     )
@@ -663,11 +669,11 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         update,
         context,
         "ℹ️ <b>Помощь</b>\n\n"
-        f"Твой Telegram ID: <code>{user.id}</code>\n"
-        f"Твой username: <code>@{user.username or 'нет'}</code>\n\n"
+        f"🆔 Telegram ID: <code>{user.id}</code>\n"
+        f"👤 Username: <code>@{user.username or 'нет'}</code>\n\n"
         "💳 Проверка BIN: отправь 6 цифр.\n"
         "👤 Контр агенты: найди контрагента и добавь тег.\n"
-        + ("⚙️ Доступ: выдача/забор доступа.\n" if is_admin else ""),
+        + ("🛡️ Доступ: выдача/забор доступа.\n" if is_admin else ""),
         reply_markup=main_keyboard(is_admin),
         parse_mode=ParseMode.HTML,
     )
@@ -720,11 +726,32 @@ async def menu_from_cp_message(update: Update, context: ContextTypes.DEFAULT_TYP
     return ConversationHandler.END
 
 
+# -------------------- ADMIN: CANCEL DURING TARGET INPUT --------------------
+async def admin_cancel_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    allowed, is_admin = await gate(update, context)
+    if not allowed:
+        await deny(update)
+        return ConversationHandler.END
+    if not is_admin:
+        await deny(update)
+        return ConversationHandler.END
+
+    q = update.callback_query
+    await q.answer()
+
+    await safe_edit_or_send(
+        update,
+        context,
+        "Ок, отменил ✅\nВыбери действие:",
+        reply_markup=admin_actions_keyboard(),
+        parse_mode=ParseMode.HTML,
+    )
+    return ADM_WAIT_ACTION
+
+
 # -------------------- BIN CHECK --------------------
 async def _binlist_lookup(bin_code: str) -> Tuple[str, str]:
-    """
-    Возвращает (issuer, country) из binlist, с TTL-кэшем.
-    """
+    """Возвращает (issuer, country) из binlist, с TTL-кэшем."""
     now = monotonic()
     cached = _BINLIST_CACHE.get(bin_code)
     if cached and cached[0] > now:
@@ -1017,13 +1044,12 @@ async def admin_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         return ConversationHandler.END
 
     await clear_bin_history(context, update.effective_chat.id)
-
     context.user_data["mode"] = MODE_NONE
 
     await safe_edit_or_send(
         update,
         context,
-        "⚙️ <b>Доступ</b>\nВыбери действие:",
+        "🛡️ <b>Управление доступом</b>\nВыбери действие:",
         reply_markup=admin_actions_keyboard(),
         parse_mode=ParseMode.HTML,
     )
@@ -1048,9 +1074,9 @@ async def admin_action_cb(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await safe_edit_or_send(
         update,
         context,
-        "Введи @username (без пробелов) или telegram_id числом:",
-        reply_markup=None,
-        parse_mode=None,
+        "🧾 Введи <b>@username</b> (без пробелов) или <b>telegram_id</b> числом:",
+        reply_markup=admin_target_keyboard(),
+        parse_mode=ParseMode.HTML,
     )
     return ADM_WAIT_TARGET
 
@@ -1139,7 +1165,7 @@ async def run_bot():
     port = int(os.environ.get("PORT", 8080))
     http_runner = await run_http_server(port)
 
-    # Включаем конкурентные апдейты + ограничиваем сеть семафором
+    # Включаем конкурентные апдейты (ускоряет ощущение "без задержек")
     application = Application.builder().token(token).concurrent_updates(True).build()
 
     application.add_handler(CommandHandler("start", start))
@@ -1153,7 +1179,7 @@ async def run_bot():
                 CallbackQueryHandler(cp_add_tag_cb, pattern=r"^cp:add$"),
                 CallbackQueryHandler(back_to_menu_cb, pattern=r"^menu:back$"),
 
-                # ✅ ВАЖНО: перехватываем кнопки меню внутри CP, иначе они попадут как "имя контрагента"
+                # FIX: кнопки меню внутри CP — не считаем их "именем контрагента"
                 MessageHandler(filters.Regex(rf"^{re.escape(BTN_BIN)}$"), menu_from_cp_message),
                 MessageHandler(filters.Regex(rf"^{re.escape(BTN_HELP)}$"), menu_from_cp_message),
                 MessageHandler(filters.Regex(rf"^{re.escape(BTN_ADMIN)}$"), menu_from_cp_message),
@@ -1166,7 +1192,7 @@ async def run_bot():
                 CallbackQueryHandler(back_to_menu_cb, pattern=r"^menu:back$"),
             ],
             CP_WAIT_COMMENT: [
-                # ✅ То же самое во время ввода комментария
+                # FIX: и во время ввода комментария тоже
                 MessageHandler(filters.Regex(rf"^{re.escape(BTN_BIN)}$"), menu_from_cp_message),
                 MessageHandler(filters.Regex(rf"^{re.escape(BTN_HELP)}$"), menu_from_cp_message),
                 MessageHandler(filters.Regex(rf"^{re.escape(BTN_ADMIN)}$"), menu_from_cp_message),
@@ -1183,7 +1209,7 @@ async def run_bot():
     )
     application.add_handler(cp_conv)
 
-    # Conversation: Админ доступ (ловим разные варианты текста)
+    # Conversation: Админ доступ
     adm_entry_pattern = rf"^({re.escape(BTN_ADMIN)}|⚙️\s*Доступ\s*\(админ\)|Доступ\s*Админ)$"
     adm_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(adm_entry_pattern), admin_entry)],
@@ -1193,8 +1219,9 @@ async def run_bot():
                 CallbackQueryHandler(back_to_menu_cb, pattern=r"^menu:back$"),
             ],
             ADM_WAIT_TARGET: [
-                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_target),
+                CallbackQueryHandler(admin_cancel_cb, pattern=r"^adm:cancel$"),
                 CallbackQueryHandler(back_to_menu_cb, pattern=r"^menu:back$"),
+                MessageHandler(filters.TEXT & ~filters.COMMAND, admin_target),
             ],
         },
         fallbacks=[CommandHandler("start", start)],
