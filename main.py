@@ -7,6 +7,7 @@ import logging
 import re
 from datetime import datetime, timezone
 from zoneinfo import ZoneInfo
+from time import monotonic
 from typing import Optional, Dict, Any, List, Tuple
 
 from aiohttp import web
@@ -37,6 +38,21 @@ logging.basicConfig(
     level=logging.INFO,
 )
 logger = logging.getLogger("bin_bot")
+
+# -------------------- GLOBAL NET LIMITS / CACHES --------------------
+# Ограничиваем параллельные сетевые операции (Supabase + binlist)
+NET_SEM = asyncio.Semaphore(int(os.getenv("NET_SEM_LIMIT", "20")))
+
+# Кэш доступа (чтобы не дергать Supabase на каждый апдейт)
+_ACCESS_CACHE: Dict[Tuple[int, Optional[str]], Tuple[float, Tuple[bool, bool]]] = {}
+_ACCESS_TTL = float(os.getenv("ACCESS_CACHE_TTL", "30"))  # секунд
+
+# Кэш BINLIST (если BIN не в локальной базе)
+_BINLIST_CACHE: Dict[str, Tuple[float, Tuple[str, str]]] = {}
+_BINLIST_TTL = float(os.getenv("BINLIST_CACHE_TTL", str(24 * 3600)))  # секунд
+
+# Сессия HTTP для всех запросов (binlist + можно расширять)
+HTTP_SESSION: Optional[aiohttp.ClientSession] = None
 
 # -------------------- BIN DB --------------------
 bin_db: Dict[str, Dict[str, str]] = {}
@@ -88,8 +104,8 @@ def get_card_scheme(bin_code: str) -> str:
 
 
 # -------------------- SUPABASE --------------------
-SUPABASE_URL = os.getenv("SUPABASE_URL", "").strip()
-SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_ROLE_KEY", "").strip()
+SUPABASE_URL = (os.getenv("SUPABASE_URL") or "").strip()
+SUPABASE_KEY = (os.getenv("SUPABASE_SERVICE_ROLE_KEY") or "").strip()
 supabase: Optional[SupabaseClient] = None
 
 
@@ -104,8 +120,9 @@ def init_supabase() -> bool:
 
 
 async def sb_exec(fn, *args, **kwargs):
-    """Запуск синхронных supabase-операций в отдельном потоке."""
-    return await asyncio.to_thread(fn, *args, **kwargs)
+    """Запуск синхронных supabase-операций в отдельном потоке + лимит параллелизма."""
+    async with NET_SEM:
+        return await asyncio.to_thread(fn, *args, **kwargs)
 
 
 def normalize_username(u: Optional[str]) -> Optional[str]:
@@ -117,8 +134,8 @@ def normalize_username(u: Optional[str]) -> Optional[str]:
     return u.lower() if u else None
 
 
-def parse_admin_ids() -> set[int]:
-    raw = os.getenv("ADMIN_IDS", "").strip()
+def parse_admin_ids() -> set:
+    raw = (os.getenv("ADMIN_IDS") or "").strip()
     ids = set()
     for part in raw.split(","):
         p = part.strip()
@@ -135,14 +152,24 @@ async def is_allowed_user(user_id: int, username: Optional[str]) -> Tuple[bool, 
     Возвращает (allowed, is_admin).
     Admin = либо в ADMIN_IDS, либо в access_list.role='admin' и is_active=true
     Allowed = либо admin, либо access_list.is_active=true
+
+    Оптимизация: TTL-кэш на 30 сек (по умолчанию).
     """
     if user_id in ADMIN_IDS:
         return True, True
 
-    if supabase is None:
-        return False, False
-
     uname = normalize_username(username)
+    cache_key = (user_id, uname)
+    now = monotonic()
+
+    cached = _ACCESS_CACHE.get(cache_key)
+    if cached and cached[0] > now:
+        return cached[1]
+
+    if supabase is None:
+        ans = (False, False)
+        _ACCESS_CACHE[cache_key] = (now + _ACCESS_TTL, ans)
+        return ans
 
     def _query_access():
         q = supabase.table("access_list").select("telegram_id, username, role, is_active").limit(1)
@@ -162,14 +189,15 @@ async def is_allowed_user(user_id: int, username: Optional[str]) -> Tuple[bool, 
         return None
 
     row = await sb_exec(_query_access)
-    if not row:
-        return False, False
-
-    if not row.get("is_active", False):
-        return False, False
+    if not row or not row.get("is_active", False):
+        ans = (False, False)
+        _ACCESS_CACHE[cache_key] = (now + _ACCESS_TTL, ans)
+        return ans
 
     role = (row.get("role") or "user").lower()
-    return True, role == "admin"
+    ans = (True, role == "admin")
+    _ACCESS_CACHE[cache_key] = (now + _ACCESS_TTL, ans)
+    return ans
 
 
 async def upsert_user_identity(user_id: int, username: Optional[str]) -> None:
@@ -269,7 +297,6 @@ def confirm_keyboard(prefix: str) -> InlineKeyboardMarkup:
 
 
 def admin_actions_keyboard() -> InlineKeyboardMarkup:
-    # Убрали "Список до 30"
     return InlineKeyboardMarkup(
         [
             [InlineKeyboardButton("✅ Выдать доступ", callback_data="adm:grant")],
@@ -291,13 +318,6 @@ async def remember_bot_message(context: ContextTypes.DEFAULT_TYPE, message_id: i
     context.user_data["last_bot_msg_id"] = message_id
 
 
-async def cleanup_previous_bot_message(context: ContextTypes.DEFAULT_TYPE, chat_id: int):
-    mid = context.user_data.get("last_bot_msg_id")
-    if mid:
-        await safe_delete_message(context, chat_id, mid)
-        context.user_data["last_bot_msg_id"] = None
-
-
 async def safe_edit_or_send(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
@@ -306,8 +326,8 @@ async def safe_edit_or_send(
     parse_mode=ParseMode.HTML,
 ):
     """
-    Если callback_query — редактируем одно сообщение.
-    Если обычное сообщение — удаляем прошлое "служебное" сообщение бота и отправляем новое.
+    Оптимизация: в личных сообщениях стараемся редактировать одно и то же "служебное"
+    сообщение бота вместо удаления/создания нового (меньше запросов к Telegram API).
     """
     if update.callback_query:
         q = update.callback_query
@@ -316,11 +336,29 @@ async def safe_edit_or_send(
         except Exception:
             m = await q.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
             await remember_bot_message(context, m.message_id)
-    else:
-        chat_id = update.effective_chat.id
-        await cleanup_previous_bot_message(context, chat_id)
-        m = await update.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
-        await remember_bot_message(context, m.message_id)
+        return
+
+    if not update.message:
+        return
+
+    chat_id = update.effective_chat.id
+    mid = context.user_data.get("last_bot_msg_id")
+
+    if mid:
+        try:
+            await context.bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=mid,
+                text=text,
+                reply_markup=reply_markup,
+                parse_mode=parse_mode,
+            )
+            return
+        except Exception:
+            pass
+
+    m = await update.message.reply_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    await remember_bot_message(context, m.message_id)
 
 
 async def try_delete_user_message(update: Update):
@@ -370,7 +408,6 @@ def parse_dt_any(dt_val: Any) -> Optional[datetime]:
         return dt_val
     if isinstance(dt_val, str):
         s = dt_val.strip()
-        # supabase часто отдаёт Z в конце
         if s.endswith("Z"):
             s = s[:-1] + "+00:00"
         try:
@@ -413,13 +450,6 @@ async def fetch_counterparty_tags(counterparty: str, limit: int = 10) -> List[Di
 
 
 def render_counterparty_card(counterparty: str, tags: List[Dict[str, Any]]) -> str:
-    """
-    Красивое отображение контрагента: статус + счетчики + последние отметки.
-    Статус на русском:
-      red   -> Высокий риск
-      yellow-> Требует внимания
-      green -> Можно работать
-    """
     cp = counterparty.strip()
 
     if not tags:
@@ -475,7 +505,6 @@ async def save_counterparty_tag(counterparty: str, color: str, comment: str, by_
     if supabase is None:
         return
 
-    # сохраняем created_at в UTC (в карточке покажем МСК)
     payload = {
         "counterparty": counterparty.strip().lower(),
         "color": color,
@@ -528,6 +557,7 @@ async def grant_access(target: str, role: str = "user") -> str:
         return "inserted_by_username"
 
     status = await sb_exec(_work)
+    _ACCESS_CACHE.clear()
     return f"✅ Доступ выдан ({status})."
 
 
@@ -553,10 +583,14 @@ async def revoke_access(target: str) -> str:
         ).ilike("username", uname).execute()
 
     await sb_exec(_work)
+    _ACCESS_CACHE.clear()
     return "⛔ Доступ отключён."
 
 
 # -------------------- ACCESS GATE --------------------
+_ID_UPSERT_TTL = float(os.getenv("ID_UPSERT_TTL", "600"))  # секунд (10 минут)
+
+
 async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tuple[bool, bool]:
     user = update.effective_user
     if not user:
@@ -564,8 +598,16 @@ async def gate(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Tuple[bool
 
     allowed, is_admin = await is_allowed_user(user.id, user.username)
 
+    # Оптимизация: upsert identity не блокирует ответ и не чаще N секунд
     if allowed:
-        await upsert_user_identity(user.id, user.username)
+        last = float(context.user_data.get("_last_id_upsert_at", 0.0) or 0.0)
+        now = monotonic()
+        if now - last > _ID_UPSERT_TTL:
+            context.user_data["_last_id_upsert_at"] = now
+            try:
+                asyncio.create_task(upsert_user_identity(user.id, user.username))
+            except Exception:
+                pass
 
     context.user_data["is_admin"] = is_admin
     return allowed, is_admin
@@ -593,9 +635,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await deny(update)
         return
 
-    # Авточистка BIN при старте (чтобы не висело старое)
     await clear_bin_history(context, update.effective_chat.id)
-
     context.user_data["mode"] = MODE_BIN
 
     await safe_edit_or_send(
@@ -616,7 +656,6 @@ async def help_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await deny(update)
         return
 
-    # Авточистка BIN при входе в помощь
     await clear_bin_history(context, update.effective_chat.id)
 
     user = update.effective_user
@@ -671,7 +710,50 @@ async def on_menu_button(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 
+# -------------------- FIX: MENU BUTTONS INSIDE CP CONVERSATION --------------------
+async def menu_from_cp_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """
+    Если пользователь нажал кнопку меню (ReplyKeyboard) во время диалога CP —
+    выходим из ConversationHandler и обрабатываем как обычное меню.
+    """
+    await on_menu_button(update, context)
+    return ConversationHandler.END
+
+
 # -------------------- BIN CHECK --------------------
+async def _binlist_lookup(bin_code: str) -> Tuple[str, str]:
+    """
+    Возвращает (issuer, country) из binlist, с TTL-кэшем.
+    """
+    now = monotonic()
+    cached = _BINLIST_CACHE.get(bin_code)
+    if cached and cached[0] > now:
+        return cached[1]
+
+    issuer = "Unknown"
+    country = "Unknown"
+
+    if HTTP_SESSION is None:
+        _BINLIST_CACHE[bin_code] = (now + 30.0, (issuer, country))
+        return issuer, country
+
+    url = f"https://lookup.binlist.net/{bin_code}"
+    headers = {"Accept-Version": "3"}
+
+    try:
+        async with NET_SEM:
+            async with HTTP_SESSION.get(url, headers=headers) as resp:
+                if resp.status == 200:
+                    data = await resp.json()
+                    issuer = data.get("bank", {}).get("name", issuer) or issuer
+                    country = data.get("country", {}).get("name", country) or country
+    except Exception as e:
+        logger.warning(f"BINLIST API error: {e}")
+
+    _BINLIST_CACHE[bin_code] = (now + _BINLIST_TTL, (issuer, country))
+    return issuer, country
+
+
 async def check_card_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     allowed, is_admin = await gate(update, context)
     if not allowed:
@@ -702,7 +784,6 @@ async def check_card_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
         )
         return
 
-    # ВАЖНО: удаляем предыдущий BIN, текущее сообщение оставляем
     await cleanup_previous_bin_message(update, context)
 
     brand = get_card_scheme(bin_code)
@@ -714,17 +795,7 @@ async def check_card_message(update: Update, context: ContextTypes.DEFAULT_TYPE)
         issuer = data.get("Issuer", issuer)
         country = data.get("CountryName", country)
     else:
-        try:
-            url = f"https://lookup.binlist.net/{bin_code}"
-            headers = {"Accept-Version": "3"}
-            async with aiohttp.ClientSession() as session:
-                async with session.get(url, headers=headers, timeout=5) as resp:
-                    if resp.status == 200:
-                        data = await resp.json()
-                        issuer = data.get("bank", {}).get("name", issuer)
-                        country = data.get("country", {}).get("name", country)
-        except Exception as e:
-            logger.warning(f"BINLIST API error: {e}")
+        issuer, country = await _binlist_lookup(bin_code)
 
     await safe_edit_or_send(
         update,
@@ -744,7 +815,6 @@ async def cp_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await deny(update)
         return ConversationHandler.END
 
-    # Авточистка BIN при входе в контрагентов
     await clear_bin_history(context, update.effective_chat.id)
 
     context.user_data["mode"] = MODE_NONE
@@ -946,7 +1016,6 @@ async def admin_entry(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await safe_edit_or_send(update, context, "⛔ Эта функция доступна только администраторам.", parse_mode=None)
         return ConversationHandler.END
 
-    # Авточистка BIN при входе в админку
     await clear_bin_history(context, update.effective_chat.id)
 
     context.user_data["mode"] = MODE_NONE
@@ -1033,6 +1102,8 @@ async def run_http_server(port: int):
 
 # -------------------- BOT RUN --------------------
 async def run_bot():
+    global HTTP_SESSION
+
     if not load_db():
         logger.critical("Не удалось загрузить базу BIN-кодов!")
         return
@@ -1046,6 +1117,16 @@ async def run_bot():
         logger.error("TELEGRAM_TOKEN не найден!")
         return
 
+    # Общая HTTP-сессия (binlist и др.)
+    try:
+        timeout = aiohttp.ClientTimeout(total=6, connect=2)
+        connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
+        HTTP_SESSION = aiohttp.ClientSession(timeout=timeout, connector=connector)
+        logger.info("HTTP_SESSION создана")
+    except Exception as e:
+        logger.warning(f"Не удалось создать HTTP_SESSION: {e}")
+        HTTP_SESSION = None
+
     # Мягко сбросим вебхук (на всякий)
     try:
         temp_app = Application.builder().token(token).build()
@@ -1058,7 +1139,8 @@ async def run_bot():
     port = int(os.environ.get("PORT", 8080))
     http_runner = await run_http_server(port)
 
-    application = Application.builder().token(token).concurrent_updates(False).build()
+    # Включаем конкурентные апдейты + ограничиваем сеть семафором
+    application = Application.builder().token(token).concurrent_updates(True).build()
 
     application.add_handler(CommandHandler("start", start))
     application.add_handler(CommandHandler("help", help_cmd))
@@ -1070,6 +1152,12 @@ async def run_bot():
             CP_WAIT_NAME: [
                 CallbackQueryHandler(cp_add_tag_cb, pattern=r"^cp:add$"),
                 CallbackQueryHandler(back_to_menu_cb, pattern=r"^menu:back$"),
+
+                # ✅ ВАЖНО: перехватываем кнопки меню внутри CP, иначе они попадут как "имя контрагента"
+                MessageHandler(filters.Regex(rf"^{re.escape(BTN_BIN)}$"), menu_from_cp_message),
+                MessageHandler(filters.Regex(rf"^{re.escape(BTN_HELP)}$"), menu_from_cp_message),
+                MessageHandler(filters.Regex(rf"^{re.escape(BTN_ADMIN)}$"), menu_from_cp_message),
+
                 MessageHandler(filters.TEXT & ~filters.COMMAND, cp_receive_name),
             ],
             CP_WAIT_COLOR: [
@@ -1078,10 +1166,16 @@ async def run_bot():
                 CallbackQueryHandler(back_to_menu_cb, pattern=r"^menu:back$"),
             ],
             CP_WAIT_COMMENT: [
+                # ✅ То же самое во время ввода комментария
+                MessageHandler(filters.Regex(rf"^{re.escape(BTN_BIN)}$"), menu_from_cp_message),
+                MessageHandler(filters.Regex(rf"^{re.escape(BTN_HELP)}$"), menu_from_cp_message),
+                MessageHandler(filters.Regex(rf"^{re.escape(BTN_ADMIN)}$"), menu_from_cp_message),
+
                 MessageHandler(filters.TEXT & ~filters.COMMAND, cp_comment),
             ],
             CP_WAIT_CONFIRM: [
                 CallbackQueryHandler(cp_confirm_cb, pattern=r"^cp:confirm:(yes|no)$"),
+                CallbackQueryHandler(back_to_menu_cb, pattern=r"^menu:back$"),
             ],
         },
         fallbacks=[CommandHandler("start", start)],
@@ -1129,10 +1223,27 @@ async def run_bot():
         logger.exception(f"Критическая ошибка: {e}")
     finally:
         logger.info("Остановка бота...")
-        await application.updater.stop()
-        await application.stop()
-        await application.shutdown()
-        await http_runner.cleanup()
+        try:
+            await application.updater.stop()
+        except Exception:
+            pass
+        try:
+            await application.stop()
+        except Exception:
+            pass
+        try:
+            await application.shutdown()
+        except Exception:
+            pass
+        try:
+            await http_runner.cleanup()
+        except Exception:
+            pass
+        try:
+            if HTTP_SESSION:
+                await HTTP_SESSION.close()
+        except Exception:
+            pass
         logger.info("Бот успешно остановлен")
 
 
